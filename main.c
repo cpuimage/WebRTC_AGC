@@ -56,12 +56,12 @@ uint64_t nanotimer() {
 #else // __linux
     struct timespec t;
     if (!ever) {
-        if (clock_gettime(CLOCK_MONOTONIC, &spec) != 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) {
             return 0;
         }
         ever = 1;
     }
-    clock_gettime(CLOCK_MONOTONIC, &spec);
+    clock_gettime(CLOCK_MONOTONIC, &t);
     return (t.tv_sec * (uint64_t)1e9) + t.tv_nsec;
 #endif
 }
