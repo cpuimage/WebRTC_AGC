@@ -24,6 +24,28 @@
 #include <stdio.h>
 #endif
 
+#ifndef MIN
+#define MIN(A, B)        ((A) < (B) ? (A) : (B))  // Get min value
+#endif
+#ifndef MAX
+#define MAX(A, B)        ((A) > (B) ? (A) : (B))  // Get max value
+#endif
+
+// Shifting with negative numbers allowed
+// Positive means left shift
+#ifndef SHIFT_W32
+#define SHIFT_W32(x, c) ((c) >= 0 ? (x) * (1 << (c)) : (x) >> -(c))
+#endif
+// C + the 32 most significant bits of A * B
+#ifndef AGC_SCALEDIFF32
+#define AGC_SCALEDIFF32(A, B, C) \
+  ((C) + ((B) >> 16) * (A) + (((0x0000FFFF & (B)) * (A)) >> 16))
+#endif
+#ifndef AGC_MUL32
+// the 32 most significant bits of A(19) * B(26) >> 13
+#define AGC_MUL32(A, B) (((B) >> 13) * (A) + (((0x00001FFF & (B)) * (A)) >> 13))
+#endif
+
 /* The slope of in Q13*/
 static const int16_t kSlope1[8] = {21793, 12517, 7189, 4129,
                                    2372, 1362, 472, 78};
@@ -127,10 +149,92 @@ static const int32_t kTargetLevelTable[64] = {
         67};
 
 
-int32_t WebRtcSpl_DotProductWithScale(const int16_t *vector1,
-                                      const int16_t *vector2,
-                                      size_t length,
-                                      int scaling) {
+static __inline int16_t DivW32W16ResW16(int32_t num, int16_t den) {
+    // Guard against division with 0
+    return (den != 0) ? (int16_t) (num / den) : (int16_t) 0x7FFF;
+}
+
+static __inline int32_t DivW32W16(int32_t num, int16_t den) {
+    // Guard against division with 0
+    return (den != 0) ? (int32_t) (num / den) : (int32_t) 0x7FFFFFFF;
+}
+
+static __inline uint32_t __clz_uint32(uint32_t v) {
+// Never used with input 0
+    assert(v > 0);
+#if defined(__INTEL_COMPILER)
+    return _bit_scan_reverse(v) ^ 31U;
+#elif defined(__GNUC__) && (__GNUC__ >= 4 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 4))
+// This will translate either to (bsr ^ 31U), clz , ctlz, cntlz, lzcnt depending on
+// -march= setting or to a software routine in exotic machines.
+    return __builtin_clz(v);
+#elif defined(_MSC_VER)
+    // for _BitScanReverse
+#include <intrin.h>
+    {
+        uint32_t idx;
+        _BitScanReverse(&idx, v);
+        return idx ^ 31U;
+    }
+#else
+// Will never be emitted for MSVC, GCC, Intel compilers
+    static const uint8_t byte_to_unary_table[] = {
+    8, 7, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    };
+    return word > 0xffffff ? byte_to_unary_table[v >> 24] :
+        word > 0xffff ? byte_to_unary_table[v >> 16] + 8 :
+        word > 0xff ? byte_to_unary_table[v >> 8] + 16 :
+        byte_to_unary_table[v] + 24;
+#endif
+}
+
+// Return the number of steps a can be left-shifted without overflow,
+// or 0 if a == 0.
+static __inline int16_t NormU32(uint32_t a) {
+
+    if (a == 0) return 0;
+    return (int16_t) __clz_uint32(a);
+}
+
+
+static __inline int16_t SatW32ToW16(int32_t value32) {
+    return (int16_t) value32 > 32767 ? (int16_t) 32767 : (value32 < -32768) ? (int16_t) (-32768) : (int16_t) value32;
+}
+
+
+// Return the number of steps a can be left-shifted without overflow,
+// or 0 if a == 0.
+static __inline int16_t NormW32(int32_t a) {
+
+    if (a == 0) return 0;
+    uint32_t v = (uint32_t) (a < 0 ? ~a : a);
+    // Returns the number of leading zero bits in the argument.
+    return (int16_t) (__clz_uint32(v) - 1);
+}
+
+static __inline int16_t WebRtcSpl_AddSatW16(int16_t a, int16_t b) {
+    return SatW32ToW16((int32_t) a + (int32_t) b);
+}
+
+int32_t DotProductWithScale(const int16_t *vector1,
+                            const int16_t *vector2,
+                            size_t length,
+                            int scaling) {
     int64_t sum = 0;
     size_t i = 0;
 
@@ -149,175 +253,85 @@ int32_t WebRtcSpl_DotProductWithScale(const int16_t *vector1,
 }
 
 
-int32_t WebRtcSpl_SqrtLocal(int32_t in) {
-
-    int16_t x_half, t16;
-    int32_t A, B, x2;
-
-    /* The following block performs:
-     y=in/2
-     x=y-2^30
-     x_half=x/2^31
-     t = 1 + (x_half) - 0.5*((x_half)^2) + 0.5*((x_half)^3) - 0.625*((x_half)^4)
-         + 0.875*((x_half)^5)
-     */
-
-    B = in / 2;
-
-    B = B - ((int32_t) 0x40000000); // B = in/2 - 1/2
-    x_half = (int16_t) (B >> 16);  // x_half = x/2 = (in-1)/2
-    B = B + ((int32_t) 0x40000000); // B = 1 + x/2
-    B = B + ((int32_t) 0x40000000); // Add 0.5 twice (since 1.0 does not exist in Q31)
-
-    x2 = ((int32_t) x_half) * ((int32_t) x_half) * 2; // A = (x/2)^2
-    A = -x2; // A = -(x/2)^2
-    B = B + (A >> 1); // B = 1 + x/2 - 0.5*(x/2)^2
-
-    A >>= 16;
-    A = A * A * 2; // A = (x/2)^4
-    t16 = (int16_t) (A >> 16);
-    B += -20480 * t16 * 2;  // B = B - 0.625*A
-    // After this, B = 1 + x/2 - 0.5*(x/2)^2 - 0.625*(x/2)^4
-
-    A = x_half * t16 * 2;  // A = (x/2)^5
-    t16 = (int16_t) (A >> 16);
-    B += 28672 * t16 * 2;  // B = B + 0.875*A
-    // After this, B = 1 + x/2 - 0.5*(x/2)^2 - 0.625*(x/2)^4 + 0.875*(x/2)^5
-
-    t16 = (int16_t) (x2 >> 16);
-    A = x_half * t16 * 2;  // A = x/2^3
-
-    B = B + (A >> 1); // B = B + 0.5*A
-    // After this, B = 1 + x/2 - 0.5*(x/2)^2 + 0.5*(x/2)^3 - 0.625*(x/2)^4 + 0.875*(x/2)^5
-
-    B = B + ((int32_t) 32768); // Round off bit
-
-    return B;
+static float fast_sqrt(float x) {
+    float s;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("sqrtss %1, %0" : "=x"(s) : "x"(x));
+#elif defined(__i386__)
+    s = x;
+    __asm__ __volatile__ ("fsqrt" : "+t"(s));
+#elif defined(__arm__) && defined(__VFP_FP__)
+    __asm__ __volatile__ ("vsqrt.f32 %0, %1" : "=w"(s) : "w"(x));
+#else
+    s = sqrtf(x);
+#endif
+    return s;
 }
 
-int32_t WebRtcSpl_Sqrt(int32_t value) {
-    /*
-     Algorithm:
+static __inline void downsampleBy2(const int16_t *in, size_t len,
+                                   int16_t *out, int32_t *filtState) {
+    int32_t tmp1, tmp2, diff, in32, out32;
+    size_t i;
 
-     Six term Taylor Series is used here to compute the square root of a number
-     y^0.5 = (1+x)^0.5 where x = y-1
-     = 1+(x/2)-0.5*((x/2)^2+0.5*((x/2)^3-0.625*((x/2)^4+0.875*((x/2)^5)
-     0.5 <= x < 1
+    register int32_t state0 = filtState[0];
+    register int32_t state1 = filtState[1];
+    register int32_t state2 = filtState[2];
+    register int32_t state3 = filtState[3];
+    register int32_t state4 = filtState[4];
+    register int32_t state5 = filtState[5];
+    register int32_t state6 = filtState[6];
+    register int32_t state7 = filtState[7];
 
-     Example of how the algorithm works, with ut=sqrt(in), and
-     with in=73632 and ut=271 (even shift value case):
+    for (i = (len >> 1); i > 0; i--) {
+        // lower allpass filter
+        in32 = (int32_t) (*in++) * (1 << 10);
+        diff = in32 - state1;
+        tmp1 = ((state0) + ((diff) >> 16) * (kResampleAllpass2[0]) +
+                (((uint32_t) ((diff) & 0x0000FFFF) * (kResampleAllpass2[0])) >> 16));
+        state0 = in32;
+        diff = tmp1 - state2;
+        tmp2 = ((state1) + ((diff) >> 16) * (kResampleAllpass2[1]) +
+                (((uint32_t) ((diff) & 0x0000FFFF) * (kResampleAllpass2[1])) >> 16));
+        state1 = tmp1;
+        diff = tmp2 - state3;
+        state3 = ((state2) + ((diff) >> 16) * (kResampleAllpass2[2]) +
+                  (((uint32_t) ((diff) & 0x0000FFFF) * (kResampleAllpass2[2])) >> 16));
+        state2 = tmp2;
 
-     in=73632
-     y= in/131072
-     x=y-1
-     t = 1 + (x/2) - 0.5*((x/2)^2) + 0.5*((x/2)^3) - 0.625*((x/2)^4) + 0.875*((x/2)^5)
-     ut=t*(1/sqrt(2))*512
+        // upper allpass filter
+        in32 = (int32_t) (*in++) * (1 << 10);
+        diff = in32 - state5;
+        tmp1 = ((state4) + ((diff) >> 16) * (kResampleAllpass1[0]) +
+                (((uint32_t) ((diff) & 0x0000FFFF) * (kResampleAllpass1[0])) >> 16));
 
-     or:
+        state4 = in32;
+        diff = tmp1 - state6;
+        tmp2 = ((state5) + ((diff) >> 16) * (kResampleAllpass1[1]) +
+                (((uint32_t) ((diff) & 0x0000FFFF) * (kResampleAllpass1[1])) >> 16));
 
-     in=73632
-     in2=73632*2^14
-     y= in2/2^31
-     x=y-1
-     t = 1 + (x/2) - 0.5*((x/2)^2) + 0.5*((x/2)^3) - 0.625*((x/2)^4) + 0.875*((x/2)^5)
-     ut=t*(1/sqrt(2))
-     ut2=ut*2^9
+        state5 = tmp1;
+        diff = tmp2 - state7;
+        state7 = ((state6) + ((diff) >> 16) * (kResampleAllpass1[2]) +
+                  (((uint32_t) ((diff) & 0x0000FFFF) * (kResampleAllpass1[2])) >> 16));
 
-     which gives:
+        state6 = tmp2;
 
-     in  = 73632
-     in2 = 1206386688
-     y   = 0.56176757812500
-     x   = -0.43823242187500
-     t   = 0.74973506527313
-     ut  = 0.53014274874797
-     ut2 = 2.714330873589594e+002
+        // add two allpass outputs, divide by two and round
+        out32 = (state3 + state7 + 1024) >> 11;
 
-     or:
-
-     in=73632
-     in2=73632*2^14
-     y=in2/2
-     x=y-2^30
-     x_half=x/2^31
-     t = 1 + (x_half) - 0.5*((x_half)^2) + 0.5*((x_half)^3) - 0.625*((x_half)^4)
-         + 0.875*((x_half)^5)
-     ut=t*(1/sqrt(2))
-     ut2=ut*2^9
-
-     which gives:
-
-     in  = 73632
-     in2 = 1206386688
-     y   = 603193344
-     x   = -470548480
-     x_half =  -0.21911621093750
-     t   = 0.74973506527313
-     ut  = 0.53014274874797
-     ut2 = 2.714330873589594e+002
-
-     */
-
-    int16_t x_norm, nshift, t16, sh;
-    int32_t A;
-
-    int16_t k_sqrt_2 = 23170; // 1/sqrt2 (==5a82)
-
-    A = value;
-
-    // The convention in this function is to calculate sqrt(abs(A)). Negate the
-    // input if it is negative.
-    if (A < 0) {
-        if (A == WEBRTC_SPL_WORD32_MIN) {
-            // This number cannot be held in an int32_t after negating.
-            // Map it to the maximum positive value.
-            A = WEBRTC_SPL_WORD32_MAX;
-        } else {
-            A = -A;
-        }
-    } else if (A == 0) {
-        return 0;  // sqrt(0) = 0
+        // limit amplitude to prevent wrap-around, and write to output array
+        *out++ = SatW32ToW16(out32);
     }
 
-    sh = WebRtcSpl_NormW32(A); // # shifts to normalize A
-    A = WEBRTC_SPL_LSHIFT_W32(A, sh); // Normalize A
-    if (A < (WEBRTC_SPL_WORD32_MAX - 32767)) {
-        A = A + ((int32_t) 32768); // Round off bit
-    } else {
-        A = WEBRTC_SPL_WORD32_MAX;
-    }
-
-    x_norm = (int16_t) (A >> 16);  // x_norm = AH
-
-    nshift = (sh / 2);
-    RTC_DCHECK_GE(nshift, 0);
-
-    A = (int32_t) WEBRTC_SPL_LSHIFT_W32((int32_t) x_norm, 16);
-    A = WEBRTC_SPL_ABS_W32(A); // A = abs(x_norm<<16)
-    A = WebRtcSpl_SqrtLocal(A); // A = sqrt(A)
-
-    if (2 * nshift == sh) {
-        // Even shift value case
-
-        t16 = (int16_t) (A >> 16);  // t16 = AH
-
-        A = k_sqrt_2 * t16 * 2;  // A = 1/sqrt(2)*t16
-        A = A + ((int32_t) 32768); // Round off
-        A = A & ((int32_t) 0x7fff0000); // Round off
-
-        A >>= 15;  // A = A>>16
-
-    } else {
-        A >>= 16;  // A = A>>16
-    }
-
-    A = A & ((int32_t) 0x0000ffff);
-    A >>= nshift;  // De-normalize the result.
-
-    return A;
+    filtState[0] = state0;
+    filtState[1] = state1;
+    filtState[2] = state2;
+    filtState[3] = state3;
+    filtState[4] = state4;
+    filtState[5] = state5;
+    filtState[6] = state6;
+    filtState[7] = state7;
 }
-
-
 
 // To generate the gaintable, copy&paste the following lines to a Matlab window:
 // MaxGain = 6; MinGain = 0; CompRatio = 3; Knee = 1;
@@ -374,10 +388,10 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
     uint16_t constMaxGain;
     uint16_t tmpU16, intPart, fracPart;
     const int16_t kCompRatio = 3;
-  //  const int16_t kSoftLimiterLeft = 1;
+    //  const int16_t kSoftLimiterLeft = 1;
     int16_t limiterOffset = 0;  // Limiter offset
     int16_t limiterIdx, limiterLvlX;
-    int16_t constLinApprox,  maxGain, diffGain;//zeroGainLvl
+    int16_t constLinApprox, maxGain, diffGain;//zeroGainLvl
     int16_t i, tmp16, tmp16no1;
     int zeros, zerosScale;
 
@@ -390,8 +404,8 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
     tmp32no1 = (digCompGaindB - analogTarget) * (kCompRatio - 1);
     tmp16no1 = analogTarget - targetLevelDbfs;
     tmp16no1 +=
-            WebRtcSpl_DivW32W16ResW16(tmp32no1 + (kCompRatio >> 1), kCompRatio);
-    maxGain = WEBRTC_SPL_MAX(tmp16no1, (analogTarget - targetLevelDbfs));
+            DivW32W16ResW16(tmp32no1 + (kCompRatio >> 1), kCompRatio);
+    maxGain = MAX(tmp16no1, (analogTarget - targetLevelDbfs));
     //  tmp32no1 = maxGain * kCompRatio;
     //  zeroGainLvl = digCompGaindB;
     // zeroGainLvl -= WebRtcSpl_DivW32W16ResW16(tmp32no1 + ((kCompRatio - 1) >> 1),      kCompRatio - 1);
@@ -405,9 +419,9 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
     //           = (compRatio-1)*digCompGaindB/compRatio
     tmp32no1 = digCompGaindB * (kCompRatio - 1);
     diffGain =
-            WebRtcSpl_DivW32W16ResW16(tmp32no1 + (kCompRatio >> 1), kCompRatio);
+            DivW32W16ResW16(tmp32no1 + (kCompRatio >> 1), kCompRatio);
     if (diffGain < 0 || diffGain >= kGenFuncTableSize) {
-        RTC_DCHECK(0);
+        assert(0);
         return -1;
     }
 
@@ -415,10 +429,10 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
     //  limiterLvlX = analogTarget - limiterOffset
     //  limiterLvl  = targetLevelDbfs + limiterOffset/compRatio
     limiterLvlX = analogTarget - limiterOffset;
-    limiterIdx = 2 + WebRtcSpl_DivW32W16ResW16((int32_t) limiterLvlX * (1 << 13),
-                                               kLog10_2 / 2);
+    limiterIdx = 2 + DivW32W16ResW16((int32_t) limiterLvlX * (1 << 13),
+                                     kLog10_2 / 2);
     tmp16no1 =
-            WebRtcSpl_DivW32W16ResW16(limiterOffset + (kCompRatio >> 1), kCompRatio);
+            DivW32W16ResW16(limiterOffset + (kCompRatio >> 1), kCompRatio);
     limiterLvl = targetLevelDbfs + tmp16no1;
 
     // Calculate (through table lookup):
@@ -433,21 +447,22 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
     // Calculate a denominator used in the exponential part to convert from dB to
     // linear scale:
     //  den = 20*constMaxGain (in Q8)
-    den = WEBRTC_SPL_MUL_16_U16(20, constMaxGain);  // in Q8
+    den = ((int32_t) (int16_t) (20) * (uint16_t) (constMaxGain));  // in Q8
 
     for (i = 0; i < 32; i++) {
         // Calculate scaled input level (compressor):
         //  inLevel =
         //  fix((-constLog10_2*(compRatio-1)*(1-i)+fix(compRatio/2))/compRatio)
         tmp16 = (int16_t) ((kCompRatio - 1) * (i - 1));       // Q0
-        tmp32 = WEBRTC_SPL_MUL_16_U16(tmp16, kLog10_2) + 1;  // Q14
-        inLevel = WebRtcSpl_DivW32W16(tmp32, kCompRatio);    // Q14
+        tmp32 = ((int32_t) (int16_t) (tmp16) * (uint16_t) (kLog10_2)) + 1;  // Q14
+        inLevel = DivW32W16(tmp32, kCompRatio);    // Q14
 
         // Calculate diffGain-inLevel, to map using the genFuncTable
         inLevel = (int32_t) diffGain * (1 << 14) - inLevel;  // Q14
 
         // Make calculations on abs(inLevel) and compensate for the sign afterwards.
-        absInLevel = (uint32_t) WEBRTC_SPL_ABS_W32(inLevel);  // Q14
+
+        absInLevel = (uint32_t) (((int32_t) (inLevel) >= 0) ? ((int32_t) (inLevel)) : -((int32_t) (inLevel))); // Q14
 
         // LUT with interpolation
         intPart = (uint16_t) (absInLevel >> 14);
@@ -460,12 +475,14 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
         // Compensate for negative exponent using the relation:
         //  log2(1 + 2^-x) = log2(1 + 2^x) - x
         if (inLevel < 0) {
-            zeros = WebRtcSpl_NormU32(absInLevel);
+            zeros = NormU32(absInLevel);
             zerosScale = 0;
             if (zeros < 15) {
                 // Not enough space for multiplication
                 tmpU32no2 = absInLevel >> (15 - zeros);                 // Q(zeros-1)
-                tmpU32no2 = WEBRTC_SPL_UMUL_32_16(tmpU32no2, kLogE_1);  // Q(zeros+13)
+
+
+                tmpU32no2 = ((uint32_t) ((uint32_t) (tmpU32no2) * (uint16_t) (kLogE_1)));  // Q(zeros+13)
                 if (zeros < 9) {
                     zerosScale = 9 - zeros;
                     tmpU32no1 >>= zerosScale;  // Q(zeros+13)
@@ -473,7 +490,7 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
                     tmpU32no2 >>= zeros - 9;  // Q22
                 }
             } else {
-                tmpU32no2 = WEBRTC_SPL_UMUL_32_16(absInLevel, kLogE_1);  // Q28
+                tmpU32no2 = ((uint32_t) ((uint32_t) (absInLevel) * (uint16_t) (kLogE_1)));  // Q28
                 tmpU32no2 >>= 6;                                         // Q22
             }
             logApprox = 0;
@@ -489,22 +506,22 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
         // Ensure we avoid wrap-around in |den| as well.
         if (numFIX > (den >> 8) || -numFIX > (den >> 8))  // |den| is Q8.
         {
-            zeros = WebRtcSpl_NormW32(numFIX);
+            zeros = NormW32(numFIX);
         } else {
-            zeros = WebRtcSpl_NormW32(den) + 8;
+            zeros = NormW32(den) + 8;
         }
         numFIX *= 1 << zeros;  // Q(14+zeros)
 
         // Shift den so we end up in Qy1
-        tmp32no1 = WEBRTC_SPL_SHIFT_W32(den, zeros - 9);  // Q(zeros - 1)
+        tmp32no1 = SHIFT_W32(den, zeros - 9);  // Q(zeros - 1)
         y32 = numFIX / tmp32no1;  // in Q15
         // This is to do rounding in Q14.
         y32 = y32 >= 0 ? (y32 + 1) >> 1 : -((-y32 + 1) >> 1);
 
         if (limiterEnable && (i < limiterIdx)) {
-            tmp32 = WEBRTC_SPL_MUL_16_U16(i - 1, kLog10_2);  // Q14
+            tmp32 = ((int32_t) (int16_t) (i - 1) * (uint16_t) (kLog10_2));  // Q14
             tmp32 -= limiterLvl * (1 << 14);                 // Q14
-            y32 = WebRtcSpl_DivW32W16(tmp32 + 10, 20);
+            y32 = DivW32W16(tmp32 + 10, 20);
         }
         if (y32 > 39000) {
             tmp32 = (y32 >> 1) * kLog10 + 4096;  // in Q27
@@ -531,7 +548,7 @@ int32_t WebRtcAgc_CalculateGainTable(int32_t *gainTable,       // Q16
             }
             fracPart = (uint16_t) tmp32no2;
             gainTable[i] =
-                    (1 << intPart) + WEBRTC_SPL_SHIFT_W32(fracPart, intPart - 14);
+                    (1 << intPart) + SHIFT_W32(fracPart, intPart - 14);
         } else {
             gainTable[i] = 0;
         }
@@ -566,7 +583,7 @@ int32_t WebRtcAgc_InitDigital(DigitalAgc *stt, int16_t agcMode) {
 int32_t WebRtcAgc_AddFarendToDigital(DigitalAgc *stt,
                                      const int16_t *in_far,
                                      size_t nrSamples) {
-    RTC_DCHECK(stt);
+    assert(stt);
     // VAD for far end
     WebRtcAgc_ProcessVad(&stt->vadFarend, in_far, nrSamples);
 
@@ -704,7 +721,7 @@ int32_t WebRtcAgc_ProcessDigital(DigitalAgc *stt,
         }
         // Translate signal level into gain, using a piecewise linear approximation
         // find number of leading zeros
-        zeros = WebRtcSpl_NormU32((uint32_t) cur_level);
+        zeros = NormU32((uint32_t) cur_level);
         if (cur_level == 0) {
             zeros = 31;
         }
@@ -723,7 +740,7 @@ int32_t WebRtcAgc_ProcessDigital(DigitalAgc *stt,
     // Gate processing (lower gain during absence of speech)
     zeros = (zeros << 9) - (frac >> 3);
     // find number of leading zeros
-    zeros_fast = WebRtcSpl_NormU32((uint32_t) stt->capacitorFast);
+    zeros_fast = NormU32((uint32_t) stt->capacitorFast);
     if (stt->capacitorFast == 0) {
         zeros_fast = 31;
     }
@@ -766,13 +783,13 @@ int32_t WebRtcAgc_ProcessDigital(DigitalAgc *stt,
         // To prevent wrap around
         zeros = 10;
         if (gains[k + 1] > 47453132) {
-            zeros = 16 - WebRtcSpl_NormW32(gains[k + 1]);
+            zeros = 16 - NormW32(gains[k + 1]);
         }
         gain32 = (gains[k + 1] >> zeros) + 1;
         gain32 *= gain32;
         // check for overflow
         while (AGC_MUL32((env[k] >> 12) + 1, gain32) >
-               WEBRTC_SPL_SHIFT_W32((int32_t) 32767, 2 * (1 - zeros + 10))) {
+               SHIFT_W32((int32_t) 32767, 2 * (1 - zeros + 10))) {
             // multiply by 253/256 ==> -0.1 dB
             if (gains[k + 1] > 8388607) {
                 // Prevent wrap around
@@ -892,9 +909,9 @@ int16_t WebRtcAgc_ProcessVad(AgcVad *state,      // (i) VAD state
             }
             in += 16;
 
-            WebRtcSpl_DownsampleBy2(buf1, 8, buf2, state->downState);
+            downsampleBy2(buf1, 8, buf2, state->downState);
         } else {
-            WebRtcSpl_DownsampleBy2(in, 8, buf2, state->downState);
+            downsampleBy2(in, 8, buf2, state->downState);
             in += 8;
         }
 
@@ -954,23 +971,23 @@ int16_t WebRtcAgc_ProcessVad(AgcVad *state,      // (i) VAD state
     // update short-term estimate of standard deviation in energy level (Q10)
     tmp32 = state->meanShortTerm * state->meanShortTerm;
     tmp32 = (state->varianceShortTerm << 12) - tmp32;
-    state->stdShortTerm = (int16_t) WebRtcSpl_Sqrt(tmp32);
+    state->stdShortTerm = (int16_t) fast_sqrt(tmp32);
 
     // update long-term estimate of mean energy level (Q10)
     tmp32 = state->meanLongTerm * state->counter + dB;
     state->meanLongTerm =
-            WebRtcSpl_DivW32W16ResW16(tmp32, WebRtcSpl_AddSatW16(state->counter, 1));
+            DivW32W16ResW16(tmp32, WebRtcSpl_AddSatW16(state->counter, 1));
 
     // update long-term estimate of variance in energy level (Q8)
     tmp32 = (dB * dB) >> 12;
     tmp32 += state->varianceLongTerm * state->counter;
     state->varianceLongTerm =
-            WebRtcSpl_DivW32W16(tmp32, WebRtcSpl_AddSatW16(state->counter, 1));
+            DivW32W16(tmp32, WebRtcSpl_AddSatW16(state->counter, 1));
 
     // update long-term estimate of standard deviation in energy level (Q10)
     tmp32 = state->meanLongTerm * state->meanLongTerm;
     tmp32 = (state->varianceLongTerm << 12) - tmp32;
-    state->stdLongTerm = (int16_t) WebRtcSpl_Sqrt(tmp32);
+    state->stdLongTerm = (int16_t) fast_sqrt(tmp32);
 
     // update voice activity measure (Q10)
     tmp16 = 3 << 12;
@@ -980,9 +997,9 @@ int16_t WebRtcAgc_ProcessVad(AgcVad *state,      // (i) VAD state
     // significant bits. This cause logRatio to max out positive, rather than
     // negative. This is a bug, but has very little significance.
     tmp32 = tmp16 * (int16_t) (dB - state->meanLongTerm);
-    tmp32 = WebRtcSpl_DivW32W16(tmp32, state->stdLongTerm);
+    tmp32 = DivW32W16(tmp32, state->stdLongTerm);
     tmpU16 = (13 << 12);
-    tmp32b = WEBRTC_SPL_MUL_16_U16(state->logRatio, tmpU16);
+    tmp32b = ((int32_t) (int16_t) (state->logRatio) * (uint16_t) (tmpU16));
     tmp32 += tmp32b >> 10;
 
     state->logRatio = (int16_t) (tmp32 >> 6);
@@ -1026,14 +1043,14 @@ int WebRtcAgc_AddMic(void *state,
     if (stt->micVol > stt->maxAnalog) {
         /* |maxLevel| is strictly >= |micVol|, so this condition should be
          * satisfied here, ensuring there is no divide-by-zero. */
-        RTC_DCHECK_GT(stt->maxLevel, stt->maxAnalog);
+        assert(stt->maxLevel > stt->maxAnalog);
 
         /* Q1 */
         tmp16 = (int16_t) (stt->micVol - stt->maxAnalog);
         tmp32 = (GAIN_TBL_LEN - 1) * tmp16;
         tmp16 = (int16_t) (stt->maxLevel - stt->maxAnalog);
         targetGainIdx = tmp32 / tmp16;
-        RTC_DCHECK_LT(targetGainIdx, GAIN_TBL_LEN);
+        assert(targetGainIdx < GAIN_TBL_LEN);
 
         /* Increment through the table towards the target gain.
          * If micVol drops below maxAnalog, we allow the gain
@@ -1092,13 +1109,13 @@ int WebRtcAgc_AddMic(void *state,
 
     for (i = 0; i < kNumSubframes / 2; i++) {
         if (stt->fs == 16000) {
-            WebRtcSpl_DownsampleBy2(&in_mic[0][i * 32], 32, tmp_speech,
-                                    stt->filterState);
+            downsampleBy2(&in_mic[0][i * 32], 32, tmp_speech,
+                          stt->filterState);
         } else {
             memcpy(tmp_speech, &in_mic[0][i * 16], 16 * sizeof(short));
         }
         /* Compute energy in blocks of 16 samples */
-        ptr[i] = WebRtcSpl_DotProductWithScale(tmp_speech, tmp_speech, 16, 4);
+        ptr[i] = DotProductWithScale(tmp_speech, tmp_speech, 16, 4);
     }
 
     /* update queue information */
@@ -1279,7 +1296,7 @@ void WebRtcAgc_UpdateAgcThresholds(LegacyAgc *stt) {
 
     /* Set analog target level in envelope dBOv scale */
     tmp16 = (DIFF_REF_TO_ANALOG * stt->compressionGaindB) + ANALOG_TARGET_LEVEL_2;
-    tmp16 = WebRtcSpl_DivW32W16ResW16((int32_t) tmp16, ANALOG_TARGET_LEVEL);
+    tmp16 = DivW32W16ResW16((int32_t) tmp16, ANALOG_TARGET_LEVEL);
     stt->analogTarget = DIGITAL_REF_AT_0_COMP_GAIN + tmp16;
     if (stt->analogTarget < DIGITAL_REF_AT_0_COMP_GAIN) {
         stt->analogTarget = DIGITAL_REF_AT_0_COMP_GAIN;
@@ -1376,7 +1393,7 @@ void WebRtcAgc_ZeroCtrl(LegacyAgc *stt, int32_t *inMicLevel, const int32_t *env)
             *inMicLevel = (1126 * *inMicLevel) >> 10;
             /* Reduces risk of a muted mic repeatedly triggering excessive levels due
              * to zero signal detection. */
-            *inMicLevel = WEBRTC_SPL_MIN(*inMicLevel, stt->zeroCtrlMax);
+            *inMicLevel = MIN(*inMicLevel, stt->zeroCtrlMax);
             stt->micVol = *inMicLevel;
         }
 
@@ -1562,7 +1579,7 @@ int32_t WebRtcAgc_ProcessAnalog(void *state,
 
         /* stt->micVol *= 0.903; */
         tmp32 = inMicLevelTmp - stt->minLevel;
-        tmpU32 = WEBRTC_SPL_UMUL(29591, (uint32_t) (tmp32));
+        tmpU32 = ((uint32_t) ((uint32_t) (29591) * (uint32_t) (tmp32)));
         stt->micVol = (tmpU32 >> 15) + stt->minLevel;
         if (stt->micVol > lastMicVol - 2) {
             stt->micVol = lastMicVol - 2;
@@ -1676,13 +1693,13 @@ int32_t WebRtcAgc_ProcessAnalog(void *state,
                      * (but never drop below the maximum analog level).
                      */
                     stt->maxLevel = (15 * stt->maxLevel + stt->micVol) / 16;
-                    stt->maxLevel = WEBRTC_SPL_MAX(stt->maxLevel, stt->maxAnalog);
+                    stt->maxLevel = MAX(stt->maxLevel, stt->maxAnalog);
 
                     stt->zeroCtrlMax = stt->micVol;
 
                     /* 0.95 in Q15 */
                     tmp32 = inMicLevelTmp - stt->minLevel;
-                    tmpU32 = WEBRTC_SPL_UMUL(31130, (uint32_t) (tmp32));
+                    tmpU32 = ((uint32_t) ((uint32_t) (31130) * (uint32_t) (tmp32)));
                     stt->micVol = (tmpU32 >> 15) + stt->minLevel;
                     if (stt->micVol > lastMicVol - 1) {
                         stt->micVol = lastMicVol - 1;
@@ -1719,14 +1736,13 @@ int32_t WebRtcAgc_ProcessAnalog(void *state,
                      * (but never drop below the maximum analog level).
                      */
                     stt->maxLevel = (15 * stt->maxLevel + stt->micVol) / 16;
-                    stt->maxLevel = WEBRTC_SPL_MAX(stt->maxLevel, stt->maxAnalog);
+                    stt->maxLevel = MAX(stt->maxLevel, stt->maxAnalog);
 
                     stt->zeroCtrlMax = stt->micVol;
 
                     /* 0.965 in Q15 */
                     //tmp32 = inMicLevelTmp - stt->minLevel;
-                    tmpU32 =
-                            WEBRTC_SPL_UMUL(31621, (uint32_t) (inMicLevelTmp - stt->minLevel));
+                    tmpU32 = ((uint32_t) ((uint32_t) (31621) * (uint32_t) ((inMicLevelTmp - stt->minLevel))));
                     stt->micVol = (tmpU32 >> 15) + stt->minLevel;
                     if (stt->micVol > lastMicVol - 1) {
                         stt->micVol = lastMicVol - 1;
@@ -1906,7 +1922,7 @@ int32_t WebRtcAgc_ProcessAnalog(void *state,
         stt->micVol = stt->minOutput;
     }
 
-    *outMicLevel = WEBRTC_SPL_MIN(stt->micVol, stt->maxAnalog) >> stt->scale;
+    *outMicLevel = MIN(stt->micVol, stt->maxAnalog) >> stt->scale;
 
     return 0;
 }
@@ -2137,7 +2153,7 @@ int WebRtcAgc_Init(void *agcInst,
 
     /* If the volume range is smaller than 0-256 then
      * the levels are shifted up to Q8-domain */
-    tmpNorm = WebRtcSpl_NormU32((uint32_t) maxLevel);
+    tmpNorm = NormU32((uint32_t) maxLevel);
     stt->scale = tmpNorm - 23;
     if (stt->scale < 0) {
         stt->scale = 0;
