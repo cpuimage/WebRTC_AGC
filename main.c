@@ -43,7 +43,7 @@ uint64_t nanotimer() {
         }
         ever = 1;
     }
-    return;
+    return 0;
 #elif defined(_WIN32)
     static LARGE_INTEGER frequency;
     if (!ever) {
@@ -81,11 +81,11 @@ double calcElapsed(double start, double end) {
 }
 
 //写wav文件
-void wavWrite_int16(char *filename, int16_t *buffer, size_t sampleRate, size_t totalSampleCount) {
+void wavWrite_int16(char *filename, int16_t *buffer, size_t sampleRate, size_t totalSampleCount, unsigned int channels) {
     drwav_data_format format = {};
     format.container = drwav_container_riff;     // <-- drwav_container_riff = normal WAV files, drwav_container_w64 = Sony Wave64.
     format.format = DR_WAVE_FORMAT_PCM;          // <-- Any of the DR_WAVE_FORMAT_* codes.
-    format.channels = 1;
+    format.channels = channels;
     format.sampleRate = (drwav_uint32) sampleRate;
     format.bitsPerSample = 16;
     drwav *pWav = drwav_open_file_write(filename, &format);
@@ -100,18 +100,10 @@ void wavWrite_int16(char *filename, int16_t *buffer, size_t sampleRate, size_t t
 }
 
 //读取wav文件
-int16_t *wavRead_int16(char *filename, uint32_t *sampleRate, uint64_t *totalSampleCount) {
-    unsigned int channels;
-    int16_t *buffer = drwav_open_and_read_file_s16(filename, &channels, sampleRate, totalSampleCount);
+int16_t *wavRead_int16(char *filename, uint32_t *sampleRate, uint64_t *totalSampleCount, unsigned int* channels) {
+    int16_t *buffer = drwav_open_and_read_file_s16(filename, channels, sampleRate, totalSampleCount);
     if (buffer == nullptr) {
         printf("读取wav文件失败.");
-    }
-    //仅仅处理单通道音频
-    if (channels != 1) {
-        drwav_free(buffer);
-        buffer = nullptr;
-        *sampleRate = 0;
-        *totalSampleCount = 0;
     }
     return buffer;
 }
@@ -205,6 +197,27 @@ int agcProcess(int16_t *buffer, uint32_t sampleRate, size_t samplesCount, int16_
         memcpy(input, out_buffer, samples * sizeof(int16_t));
         input += samples;
     }
+
+    const size_t remainedSamples = samplesCount - nTotal * samples;
+    if (remainedSamples > 0) {
+        if (nTotal > 0) {
+            input = input - samples + remainedSamples;
+        }
+
+        inMicLevel = 0;
+        int nAgcRet = WebRtcAgc_Process(agcInst, (const int16_t *const *) &input, num_bands, samples,
+                                        (int16_t *const *) &out16, inMicLevel, &outMicLevel, echo,
+                                        &saturationWarning);
+
+        if (nAgcRet != 0) {
+            printf("failed in WebRtcAgc_Process during filtering the last chunk\n");
+            WebRtcAgc_Free(agcInst);
+            return -1;
+        }
+        memcpy(&input[samples-remainedSamples], &out_buffer[samples-remainedSamples], remainedSamples * sizeof(int16_t));
+        input += samples;
+    }
+
     WebRtcAgc_Free(agcInst);
     return 1;
 }
@@ -214,7 +227,8 @@ void auto_gain(char *in_file, char *out_file) {
     uint32_t sampleRate = 0;
     //总音频采样数
     uint64_t inSampleCount = 0;
-    int16_t *inBuffer = wavRead_int16(in_file, &sampleRate, &inSampleCount);
+    unsigned int channels = 0;
+    int16_t *inBuffer = wavRead_int16(in_file, &sampleRate, &inSampleCount, &channels);
     //如果加载成功
     if (inBuffer != nullptr) {
         //  kAgcModeAdaptiveAnalog  模拟音量调节
@@ -227,10 +241,10 @@ void auto_gain(char *in_file, char *out_file) {
         double elapsed_time = calcElapsed(startTime, now());
 
         printf("time: %d ms\n ", (int) (elapsed_time * 1000));
-        wavWrite_int16(out_file, inBuffer, sampleRate, inSampleCount);
+        wavWrite_int16(out_file, inBuffer, sampleRate, inSampleCount, channels);
         free(inBuffer);
     }
-}
+ }
 
 int main(int argc, char *argv[]) {
     printf("WebRTC Automatic Gain Control\n");
